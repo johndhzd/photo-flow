@@ -23,7 +23,7 @@ from photo_flow.config import ConfigError, load_config
 from photo_flow.converter import build_conversion_plans, convert_all
 from photo_flow.dependencies import missing_tools, required_tools_for
 from photo_flow.estimator import choose_sample_files, estimate_total_size, format_bytes
-from photo_flow.integrity import verify_converted_file
+from photo_flow.integrity import identify_image, verify_converted_file
 from photo_flow.logging_setup import configure_logging
 from photo_flow.metadata import copy_metadata, read_metadata
 from photo_flow.models import OutputFormat
@@ -163,6 +163,7 @@ def run_command(args: argparse.Namespace) -> int:
                 logging.error("%s: %s", error.path, error.reason)
             raise RuntimeError("Converted file verification failed")
         read_metadata(plan.output_file)
+        identify_image(plan.output_file)
         verification_messages.append(f"{plan.output_file.name} ok")
 
     if confirm(f"Move {len(inventory.tiff_files)} TIFF files to macOS Trash?", assume_yes=False):
