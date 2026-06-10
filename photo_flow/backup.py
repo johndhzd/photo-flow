@@ -76,6 +76,31 @@ def write_manifest(path: Path, manifest: Mapping[str, object]) -> None:
     path.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
 
 
+def stage_backup_files(
+    staging_dir: Path,
+    *,
+    raw_files: Sequence[Path],
+    original_heic_files: Sequence[Path],
+    converted_files: Sequence[Path],
+    log_path: Path,
+) -> tuple[Path, ...]:
+    staged: list[Path] = []
+    groups = (
+        ("raw", raw_files),
+        ("original_heic", original_heic_files),
+        ("converted", converted_files),
+        ("logs", (log_path,)),
+    )
+    for directory_name, files in groups:
+        target_dir = staging_dir / directory_name
+        target_dir.mkdir(parents=True, exist_ok=True)
+        for source in files:
+            target = target_dir / source.name
+            shutil.copy2(source, target)
+            staged.append(target)
+    return tuple(staged)
+
+
 def build_archive_command(plan: BackupPlan, *, password: str | None) -> tuple[str, ...]:
     if plan.encrypted:
         if not password:

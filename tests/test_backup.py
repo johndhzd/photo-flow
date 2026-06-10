@@ -7,6 +7,7 @@ from photo_flow.backup import (
     build_archive_command,
     copy_to_existing_destinations,
     create_manifest,
+    stage_backup_files,
     sha256_file,
 )
 from photo_flow.models import OutputFormat
@@ -88,3 +89,38 @@ def test_copy_to_existing_destinations_skips_missing_paths(tmp_path):
     assert copied == (existing / "backup.zip",)
     assert (existing / "backup.zip").read_bytes() == b"archive"
     assert warnings == (f"Backup destination does not exist: {missing}",)
+
+
+def test_stage_backup_files_keeps_original_and_converted_heic_separate(tmp_path):
+    raw = tmp_path / "raw" / "DSC0001.ARW"
+    original = tmp_path / "original" / "DSC0001.heic"
+    converted = tmp_path / "converted" / "DSC0001.heic"
+    log = tmp_path / "logs" / "run.log"
+    for path, content in (
+        (raw, b"raw"),
+        (original, b"original"),
+        (converted, b"converted"),
+        (log, b"log"),
+    ):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+    staging = tmp_path / "stage"
+
+    staged = stage_backup_files(
+        staging,
+        raw_files=(raw,),
+        original_heic_files=(original,),
+        converted_files=(converted,),
+        log_path=log,
+    )
+
+    assert (staging / "raw" / "DSC0001.ARW").read_bytes() == b"raw"
+    assert (staging / "original_heic" / "DSC0001.heic").read_bytes() == b"original"
+    assert (staging / "converted" / "DSC0001.heic").read_bytes() == b"converted"
+    assert (staging / "logs" / "run.log").read_bytes() == b"log"
+    assert staged == (
+        staging / "raw" / "DSC0001.ARW",
+        staging / "original_heic" / "DSC0001.heic",
+        staging / "converted" / "DSC0001.heic",
+        staging / "logs" / "run.log",
+    )
