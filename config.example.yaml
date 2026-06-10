@@ -1,0 +1,21 @@
+raw_dir: /path/to/session/raw
+original_heic_dir: /path/to/session/original_heic
+tiff_dir: /path/to/session/tiff_exports
+converted_output_dir: /path/to/session/converted
+log_dir: /path/to/photo-flow/logs
+
+default_format: heic
+default_quality: 90
+overwrite_existing: false
+
+raw_extensions:
+  - .arw
+  - .cr3
+  - .nef
+  - .raf
+  - .rw2
+  - .dng
+
+backup_destinations:
+  - /Volumes/BackupDrive/PhotoBackups
+  - /Volumes/NAS/PhotoBackups
