@@ -10,14 +10,16 @@ from pathlib import Path
 from typing import Sequence
 
 from photo_flow.backup import archive_name, bundle_archives, zip_files
+from photo_flow.commands import run_command as run_external_command
 from photo_flow.config import ConfigError, load_config
-from photo_flow.converter import build_conversion_plans, convert_all
+from photo_flow.converter import build_conversion_command, build_conversion_plans
 from photo_flow.dependencies import bundle_tools, conversion_tools, missing_tools
 from photo_flow.estimator import choose_sample_files, estimate_total_size, format_bytes
 from photo_flow.integrity import identify_image, verify_converted_file
 from photo_flow.logging_setup import configure_logging
-from photo_flow.metadata import copy_metadata, read_metadata
+from photo_flow.metadata import build_copy_metadata_command, read_metadata
 from photo_flow.models import OutputFormat, RootConfig
+from photo_flow.progress import ProgressBar
 from photo_flow.scanner import (
     TIFF_EXTENSIONS,
     files_in,
@@ -184,17 +186,27 @@ def do_convert(
         overwrite=overwrite,
     )
     print(f"Converting {len(plans)} TIFF files to {output_format.value} in {output_dir}")
-    convert_all(plans)
-    copy_metadata(plans)
-    for plan in plans:
-        errors = verify_converted_file(plan.output_file)
-        if errors:
-            for error in errors:
-                logging.error("%s: %s", error.path, error.reason)
-            raise RuntimeError(f"Converted file verification failed: {plan.output_file}")
-        read_metadata(plan.output_file)
-        identify_image(plan.output_file)
-        logging.info("Converted %s -> %s", plan.source_tiff.name, plan.output_file.name)
+
+    # Phase 1 — convert (slow: one external magick/cjxl call per file).
+    with ProgressBar(len(plans), desc="Converting") as bar:
+        for plan in plans:
+            run_external_command(build_conversion_command(plan), check=True)
+            bar.advance(plan.source_tiff.name)
+
+    # Phase 2 — copy metadata + integrity check (fast, but confirms correctness).
+    with ProgressBar(len(plans), desc="Verifying ") as bar:
+        for plan in plans:
+            run_external_command(build_copy_metadata_command(plan), check=True)
+            errors = verify_converted_file(plan.output_file)
+            if errors:
+                for error in errors:
+                    logging.error("%s: %s", error.path, error.reason)
+                raise RuntimeError(f"Converted file verification failed: {plan.output_file}")
+            read_metadata(plan.output_file)
+            identify_image(plan.output_file)
+            logging.info("Converted %s -> %s", plan.source_tiff.name, plan.output_file.name)
+            bar.advance(plan.output_file.name)
+
     return tuple(plan.output_file for plan in plans)
 
 
@@ -205,7 +217,8 @@ def do_backup_heic(config: RootConfig, session_date: str, raw_name: str) -> Path
             f"No original HEIC/HIF files found in {config.raw_folder(raw_name)}"
         )
     dest = config.backup_work_dir(session_date) / HEIC_ZIP
-    zip_files(files, dest)
+    with ProgressBar(len(files), desc="Packing HEIC") as bar:
+        zip_files(files, dest, on_file=bar.advance)
     logging.info("Zipped %d original HEIC files -> %s", len(files), dest)
     print(f"Created {dest} ({len(files)} files)")
     return dest
@@ -216,7 +229,8 @@ def do_backup_raw(config: RootConfig, session_date: str, raw_name: str) -> Path:
     if not files:
         raise SessionError(f"No RAW files found in {config.raw_folder(raw_name)}")
     dest = config.backup_work_dir(session_date) / RAW_ZIP
-    zip_files(files, dest)
+    with ProgressBar(len(files), desc="Packing RAW ") as bar:
+        zip_files(files, dest, on_file=bar.advance)
     logging.info("Zipped %d RAW files -> %s", len(files), dest)
     print(f"Created {dest} ({len(files)} files)")
     return dest
@@ -243,7 +257,8 @@ def do_backup_edited(
             f"No edited files available for {session_date} after conversion attempt"
         )
     dest = config.backup_work_dir(session_date) / EDITED_ZIP
-    zip_files(files, dest)
+    with ProgressBar(len(files), desc="Packing edited") as bar:
+        zip_files(files, dest, on_file=bar.advance)
     logging.info("Zipped %d edited files -> %s", len(files), dest)
     print(f"Created {dest} ({len(files)} files)")
     return dest
@@ -276,7 +291,8 @@ def do_bundle(
     else:
         password = None
 
-    bundle_archives(existing, final_archive, encrypt=encrypt, password=password)
+    with ProgressBar(len(existing), desc="Bundling") as bar:
+        bundle_archives(existing, final_archive, encrypt=encrypt, password=password, on_file=bar.advance)
     logging.info("Bundled %d archives -> %s", len(existing), final_archive)
     print(f"Bundle created: {final_archive}")
     for path in existing:
@@ -324,7 +340,10 @@ def estimate_command(args: argparse.Namespace) -> int:
             for plan in plans:
                 plan.output_file.write_bytes(b"x" * args.dry_sample_size)
         else:
-            convert_all(plans)
+            with ProgressBar(len(plans), desc="Sampling") as bar:
+                for plan in plans:
+                    run_external_command(build_conversion_command(plan), check=True)
+                    bar.advance(plan.source_tiff.name)
         result = estimate_total_size(
             samples_source,
             samples,

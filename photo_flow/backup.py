@@ -10,6 +10,7 @@ from photo_flow.models import CommandResult
 
 
 CategoryRunner = Callable[[Sequence[str]], CommandResult]
+ProgressFn = Callable[[str], None]
 
 
 def archive_name(run_date: date, tags: Sequence[str], *, encrypted: bool) -> str:
@@ -30,11 +31,18 @@ def _clean_tag(tag: str) -> str:
     return "".join(char if char.isalnum() or char in ("-", "_") else "_" for char in tag.strip())
 
 
-def zip_files(files: Sequence[Path], dest_zip: Path, *, compress: bool = False) -> Path:
+def zip_files(
+    files: Sequence[Path],
+    dest_zip: Path,
+    *,
+    compress: bool = False,
+    on_file: ProgressFn | None = None,
+) -> Path:
     """Write ``files`` into ``dest_zip`` with flattened (basename) entries.
 
     Defaults to stored (uncompressed) entries because raw, HEIF and converted
     photos are already compressed; deflating them wastes time for no gain.
+    ``on_file`` is called with the entry name after each file is written.
     """
 
     if not files:
@@ -51,6 +59,8 @@ def zip_files(files: Sequence[Path], dest_zip: Path, *, compress: bool = False) 
                 raise ValueError(f"Duplicate file name in archive: {arcname}")
             seen.add(arcname)
             archive.write(source, arcname=arcname)
+            if on_file:
+                on_file(arcname)
     return dest_zip
 
 
@@ -80,11 +90,14 @@ def bundle_archives(
     encrypt: bool,
     password: str | None = None,
     runner: CategoryRunner | None = None,
+    on_file: ProgressFn | None = None,
 ) -> Path:
     """Combine the per-category zips into a single final archive.
 
     Unencrypted bundles are plain (stored) zips. Encrypted bundles delegate to
     ``7z`` with header encryption enabled.
+    ``on_file`` is called with each entry name as it is added (unencrypted only;
+    the 7z process manages its own output).
     """
 
     if not category_zips:
@@ -106,4 +119,6 @@ def bundle_archives(
                 raise ValueError(f"Duplicate file name in bundle: {arcname}")
             seen.add(arcname)
             archive.write(source, arcname=arcname)
+            if on_file:
+                on_file(arcname)
     return final_archive
