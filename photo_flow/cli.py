@@ -18,7 +18,8 @@ from photo_flow.estimator import choose_sample_files, estimate_total_size, forma
 from photo_flow.integrity import identify_image, verify_converted_file
 from photo_flow.logging_setup import configure_logging
 from photo_flow.metadata import build_copy_metadata_command, read_metadata
-from photo_flow.models import OutputFormat, RootConfig
+from photo_flow.models import ConversionPlan, OutputFormat, RootConfig
+from photo_flow.parallel import default_workers, parallel_map
 from photo_flow.progress import ProgressBar
 from photo_flow.scanner import (
     TIFF_EXTENSIONS,
@@ -113,6 +114,13 @@ def _add_config_date(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--config", required=True, type=Path)
     parser.add_argument("--date", dest="session_date", help="session date YYYY_MM_DD")
     parser.add_argument("--yes", action="store_true", help="auto-confirm prompts and skip interactive selection")
+    parser.add_argument(
+        "-j",
+        "--workers",
+        type=int,
+        default=0,
+        help="parallel workers for conversion/verification (0 = auto, 1 = serial)",
+    )
 
 
 def _add_format_quality(parser: argparse.ArgumentParser) -> None:
@@ -151,9 +159,30 @@ def _start_logging(config: RootConfig) -> Path:
     return configure_logging(config.log_dir, timestamp)
 
 
+def _resolve_workers(args: argparse.Namespace) -> int:
+    value = getattr(args, "workers", 0)
+    return value if value >= 1 else default_workers()
+
+
 # --------------------------------------------------------------------------- #
 # Core operations (reused by both standalone commands and the run pipeline).
 # --------------------------------------------------------------------------- #
+
+
+def _convert_one(plan: ConversionPlan) -> None:
+    run_external_command(build_conversion_command(plan), check=True)
+
+
+def _verify_one(plan: ConversionPlan) -> None:
+    run_external_command(build_copy_metadata_command(plan), check=True)
+    errors = verify_converted_file(plan.output_file)
+    if errors:
+        for error in errors:
+            logging.error("%s: %s", error.path, error.reason)
+        raise RuntimeError(f"Converted file verification failed: {plan.output_file}")
+    read_metadata(plan.output_file)
+    identify_image(plan.output_file)
+    logging.info("Converted %s -> %s", plan.source_tiff.name, plan.output_file.name)
 
 
 def do_convert(
@@ -163,6 +192,7 @@ def do_convert(
     quality: int,
     *,
     overwrite: bool,
+    workers: int = 1,
 ) -> tuple[Path, ...]:
     tiff_dir = config.tiff_dir_for(session_date)
     tiffs = files_in(tiff_dir, TIFF_EXTENSIONS)
@@ -185,27 +215,23 @@ def do_convert(
         quality=quality,
         overwrite=overwrite,
     )
-    print(f"Converting {len(plans)} TIFF files to {output_format.value} in {output_dir}")
+    print(f"Converting {len(plans)} TIFF files to {output_format.value} "
+          f"in {output_dir} ({workers} workers)")
 
-    # Phase 1 — convert (slow: one external magick/cjxl call per file).
-    with ProgressBar(len(plans), desc="Converting") as bar:
-        for plan in plans:
-            run_external_command(build_conversion_command(plan), check=True)
-            bar.advance(plan.source_tiff.name)
-
-    # Phase 2 — copy metadata + integrity check (fast, but confirms correctness).
-    with ProgressBar(len(plans), desc="Verifying ") as bar:
-        for plan in plans:
-            run_external_command(build_copy_metadata_command(plan), check=True)
-            errors = verify_converted_file(plan.output_file)
-            if errors:
-                for error in errors:
-                    logging.error("%s: %s", error.path, error.reason)
-                raise RuntimeError(f"Converted file verification failed: {plan.output_file}")
-            read_metadata(plan.output_file)
-            identify_image(plan.output_file)
-            logging.info("Converted %s -> %s", plan.source_tiff.name, plan.output_file.name)
-            bar.advance(plan.output_file.name)
+    parallel_map(
+        plans,
+        _convert_one,
+        workers=workers,
+        desc="Converting",
+        label_fn=lambda p: p.source_tiff.name,
+    )
+    parallel_map(
+        plans,
+        _verify_one,
+        workers=workers,
+        desc="Verifying ",
+        label_fn=lambda p: p.output_file.name,
+    )
 
     return tuple(plan.output_file for plan in plans)
 
@@ -243,6 +269,7 @@ def do_backup_edited(
     quality: int,
     *,
     overwrite: bool,
+    workers: int = 1,
 ) -> Path:
     files = processed_files(config, session_date)
     if not files:
@@ -250,7 +277,7 @@ def do_backup_edited(
             f"No edited files in {config.processed_dir_for(session_date)}; "
             "converting from TIFF exports first."
         )
-        do_convert(config, session_date, output_format, quality, overwrite=overwrite)
+        do_convert(config, session_date, output_format, quality, overwrite=overwrite, workers=workers)
         files = processed_files(config, session_date)
     if not files:
         raise SessionError(
@@ -313,6 +340,7 @@ def do_bundle(
 def estimate_command(args: argparse.Namespace) -> int:
     config = load_config(args.config)
     output_format, quality = resolve_format_and_quality(args, config)
+    workers = _resolve_workers(args)
     session_date = resolve_session_date(
         config,
         args.session_date,
@@ -340,10 +368,13 @@ def estimate_command(args: argparse.Namespace) -> int:
             for plan in plans:
                 plan.output_file.write_bytes(b"x" * args.dry_sample_size)
         else:
-            with ProgressBar(len(plans), desc="Sampling") as bar:
-                for plan in plans:
-                    run_external_command(build_conversion_command(plan), check=True)
-                    bar.advance(plan.source_tiff.name)
+            parallel_map(
+                plans,
+                _convert_one,
+                workers=workers,
+                desc="Sampling",
+                label_fn=lambda p: p.source_tiff.name,
+            )
         result = estimate_total_size(
             samples_source,
             samples,
@@ -363,6 +394,7 @@ def estimate_command(args: argparse.Namespace) -> int:
 def convert_command(args: argparse.Namespace) -> int:
     config = load_config(args.config)
     output_format, quality = resolve_format_and_quality(args, config)
+    workers = _resolve_workers(args)
     session_date = resolve_session_date(
         config,
         args.session_date,
@@ -373,7 +405,7 @@ def convert_command(args: argparse.Namespace) -> int:
     )
     overwrite = args.overwrite or config.overwrite_existing
     _start_logging(config)
-    outputs = do_convert(config, session_date, output_format, quality, overwrite=overwrite)
+    outputs = do_convert(config, session_date, output_format, quality, overwrite=overwrite, workers=workers)
     print(f"Converted {len(outputs)} files into {config.processed_dir_for(session_date)}")
     return 0
 
@@ -427,6 +459,7 @@ def backup_raw_command(args: argparse.Namespace) -> int:
 def backup_edited_command(args: argparse.Namespace) -> int:
     config = load_config(args.config)
     output_format, quality = resolve_format_and_quality(args, config)
+    workers = _resolve_workers(args)
     session_date = resolve_session_date(
         config,
         args.session_date,
@@ -437,7 +470,7 @@ def backup_edited_command(args: argparse.Namespace) -> int:
     )
     overwrite = args.overwrite or config.overwrite_existing
     _start_logging(config)
-    do_backup_edited(config, session_date, output_format, quality, overwrite=overwrite)
+    do_backup_edited(config, session_date, output_format, quality, overwrite=overwrite, workers=workers)
     return 0
 
 
@@ -468,6 +501,7 @@ def bundle_command(args: argparse.Namespace) -> int:
 def run_command(args: argparse.Namespace) -> int:
     config = load_config(args.config)
     output_format, quality = resolve_format_and_quality(args, config)
+    workers = _resolve_workers(args)
     session_date = resolve_session_date(
         config,
         args.session_date,
@@ -493,7 +527,7 @@ def run_command(args: argparse.Namespace) -> int:
     logging.info("Starting photo-flow run for %s (raw folder %s)", session_date, raw_name)
     do_backup_heic(config, session_date, raw_name)
     do_backup_raw(config, session_date, raw_name)
-    do_backup_edited(config, session_date, output_format, quality, overwrite=overwrite)
+    do_backup_edited(config, session_date, output_format, quality, overwrite=overwrite, workers=workers)
     do_bundle(
         config,
         session_date,
