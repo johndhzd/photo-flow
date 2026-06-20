@@ -9,68 +9,134 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Sequence
 
-from photo_flow.backup import (
-    BackupPlan,
-    archive_name,
-    build_archive_command,
-    copy_to_existing_destinations,
-    create_manifest,
-    stage_backup_files,
-    write_manifest,
-)
-from photo_flow.commands import run_command as run_external_command
+from photo_flow.backup import archive_name, bundle_archives, zip_files
 from photo_flow.config import ConfigError, load_config
 from photo_flow.converter import build_conversion_plans, convert_all
-from photo_flow.dependencies import missing_tools, required_tools_for
+from photo_flow.dependencies import bundle_tools, conversion_tools, missing_tools
 from photo_flow.estimator import choose_sample_files, estimate_total_size, format_bytes
 from photo_flow.integrity import identify_image, verify_converted_file
 from photo_flow.logging_setup import configure_logging
 from photo_flow.metadata import copy_metadata, read_metadata
-from photo_flow.models import OutputFormat
-from photo_flow.scanner import ScanError, scan_session
-from photo_flow.trash import trash_files
+from photo_flow.models import OutputFormat, RootConfig
+from photo_flow.scanner import (
+    TIFF_EXTENSIONS,
+    files_in,
+    original_heic_files,
+    processed_files,
+    raw_files,
+    tiff_files,
+)
+from photo_flow.sessions import (
+    SessionError,
+    available_dates,
+    list_tiff_dates,
+    parse_session_date,
+    resolve_raw_folder,
+    resolve_session_date,
+)
+
+
+HEIC_ZIP = "original_heic.zip"
+RAW_ZIP = "original_raw.zip"
+EDITED_ZIP = "edited.zip"
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    handlers = {
+        "estimate": estimate_command,
+        "convert": convert_command,
+        "backup-heic": backup_heic_command,
+        "backup-raw": backup_raw_command,
+        "backup-edited": backup_edited_command,
+        "bundle": bundle_command,
+        "run": run_command,
+    }
+    handler = handlers.get(args.command)
+    if handler is None:
+        parser.print_help()
+        return 2
     try:
-        if args.command == "estimate":
-            return estimate_command(args)
-        if args.command == "run":
-            return run_command(args)
-    except (ConfigError, ScanError, ValueError, RuntimeError) as exc:
+        return handler(args)
+    except (ConfigError, SessionError, ValueError, RuntimeError) as exc:
         print(f"Error: {exc}")
         return 1
-    parser.print_help()
-    return 2
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="photo-flow")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    estimate = subparsers.add_parser("estimate", help="estimate converted output size")
-    add_common_options(estimate)
+    estimate = subparsers.add_parser("estimate", help="estimate converted output size for a session")
+    _add_config_date(estimate)
+    _add_format_quality(estimate)
     estimate.add_argument("--dry-sample-size", type=int, default=0, help=argparse.SUPPRESS)
 
-    run = subparsers.add_parser("run", help="run conversion, cleanup, and backup workflow")
-    add_common_options(run)
-    run.add_argument("--tags", default="", help="comma-separated tags for the backup name")
-    run.add_argument("--encrypt", action="store_true", help="create encrypted .7z backup")
-    run.add_argument("--yes", action="store_true", help="auto-confirm non-destructive prompts")
-    run.add_argument("--dry-run", action="store_true", help="print planned work without external tool execution")
+    convert = subparsers.add_parser("convert", help="convert TIFF exports into the processed folder")
+    _add_config_date(convert)
+    _add_format_quality(convert)
+    convert.add_argument("--overwrite", action="store_true")
+
+    backup_heic = subparsers.add_parser("backup-heic", help="zip original HEIC/HIF files for a session")
+    _add_config_date(backup_heic)
+    backup_heic.add_argument("--raw", dest="raw_name", help="RawPhotos folder name override")
+
+    backup_raw = subparsers.add_parser("backup-raw", help="zip original RAW files for a session")
+    _add_config_date(backup_raw)
+    backup_raw.add_argument("--raw", dest="raw_name", help="RawPhotos folder name override")
+
+    backup_edited = subparsers.add_parser(
+        "backup-edited", help="zip edited/converted files (auto-converts when missing)"
+    )
+    _add_config_date(backup_edited)
+    _add_format_quality(backup_edited)
+    backup_edited.add_argument("--overwrite", action="store_true")
+
+    bundle = subparsers.add_parser("bundle", help="bundle category zips into the final archive")
+    _add_config_date(bundle)
+    _add_bundle_options(bundle)
+
+    run = subparsers.add_parser("run", help="full pipeline: heic + raw + edited + bundle for a session")
+    _add_config_date(run)
+    _add_format_quality(run)
+    run.add_argument("--overwrite", action="store_true")
+    run.add_argument("--raw", dest="raw_name", help="RawPhotos folder name override")
+    _add_bundle_options(run)
+
     return parser
 
 
-def add_common_options(parser: argparse.ArgumentParser) -> None:
+def _add_config_date(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--config", required=True, type=Path)
+    parser.add_argument("--date", dest="session_date", help="session date YYYY_MM_DD")
+    parser.add_argument("--yes", action="store_true", help="auto-confirm prompts and skip interactive selection")
+
+
+def _add_format_quality(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--format", dest="output_format", choices=["heic", "jpg", "jpeg", "png", "jxl"])
     parser.add_argument("--quality", type=int)
-    parser.add_argument("--overwrite", action="store_true")
 
 
-def resolve_format_and_quality(args: argparse.Namespace, config) -> tuple[OutputFormat, int]:
+def _add_bundle_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--tags", default=None, help="comma-separated tags for the final archive name")
+    parser.add_argument("--encrypt", action="store_true", help="create an encrypted .7z archive")
+    delete_group = parser.add_mutually_exclusive_group()
+    delete_group.add_argument(
+        "--delete-intermediate",
+        dest="delete_intermediate",
+        action="store_true",
+        help="delete the Backups/<date> working folder after bundling",
+    )
+    delete_group.add_argument(
+        "--keep-intermediate",
+        dest="keep_intermediate",
+        action="store_true",
+        help="keep the Backups/<date> working folder after bundling",
+    )
+
+
+def resolve_format_and_quality(args: argparse.Namespace, config: RootConfig) -> tuple[OutputFormat, int]:
     output_format = OutputFormat.parse(args.output_format) if args.output_format else config.default_format
     quality = args.quality if args.quality is not None else config.default_quality
     if not 1 <= quality <= 100:
@@ -78,13 +144,171 @@ def resolve_format_and_quality(args: argparse.Namespace, config) -> tuple[Output
     return output_format, quality
 
 
+def _start_logging(config: RootConfig) -> Path:
+    timestamp = datetime.now(timezone.utc)
+    return configure_logging(config.log_dir, timestamp)
+
+
+# --------------------------------------------------------------------------- #
+# Core operations (reused by both standalone commands and the run pipeline).
+# --------------------------------------------------------------------------- #
+
+
+def do_convert(
+    config: RootConfig,
+    session_date: str,
+    output_format: OutputFormat,
+    quality: int,
+    *,
+    overwrite: bool,
+) -> tuple[Path, ...]:
+    tiff_dir = config.tiff_dir_for(session_date)
+    tiffs = files_in(tiff_dir, TIFF_EXTENSIONS)
+    if not tiffs:
+        raise SessionError(f"No TIFF files to convert in {tiff_dir}")
+
+    missing = missing_tools(conversion_tools(output_format))
+    if missing:
+        raise RuntimeError(f"Missing required tools: {', '.join(missing)}")
+
+    if output_format is OutputFormat.PNG:
+        logging.warning("PNG output is lossless; quality setting is ignored by conversion")
+        print("Warning: PNG output is lossless; quality setting is ignored.")
+
+    output_dir = config.processed_dir_for(session_date)
+    plans = build_conversion_plans(
+        tiffs,
+        output_dir=output_dir,
+        output_format=output_format,
+        quality=quality,
+        overwrite=overwrite,
+    )
+    print(f"Converting {len(plans)} TIFF files to {output_format.value} in {output_dir}")
+    convert_all(plans)
+    copy_metadata(plans)
+    for plan in plans:
+        errors = verify_converted_file(plan.output_file)
+        if errors:
+            for error in errors:
+                logging.error("%s: %s", error.path, error.reason)
+            raise RuntimeError(f"Converted file verification failed: {plan.output_file}")
+        read_metadata(plan.output_file)
+        identify_image(plan.output_file)
+        logging.info("Converted %s -> %s", plan.source_tiff.name, plan.output_file.name)
+    return tuple(plan.output_file for plan in plans)
+
+
+def do_backup_heic(config: RootConfig, session_date: str, raw_name: str) -> Path:
+    files = original_heic_files(config, raw_name)
+    if not files:
+        raise SessionError(
+            f"No original HEIC/HIF files found in {config.raw_folder(raw_name)}"
+        )
+    dest = config.backup_work_dir(session_date) / HEIC_ZIP
+    zip_files(files, dest)
+    logging.info("Zipped %d original HEIC files -> %s", len(files), dest)
+    print(f"Created {dest} ({len(files)} files)")
+    return dest
+
+
+def do_backup_raw(config: RootConfig, session_date: str, raw_name: str) -> Path:
+    files = raw_files(config, raw_name)
+    if not files:
+        raise SessionError(f"No RAW files found in {config.raw_folder(raw_name)}")
+    dest = config.backup_work_dir(session_date) / RAW_ZIP
+    zip_files(files, dest)
+    logging.info("Zipped %d RAW files -> %s", len(files), dest)
+    print(f"Created {dest} ({len(files)} files)")
+    return dest
+
+
+def do_backup_edited(
+    config: RootConfig,
+    session_date: str,
+    output_format: OutputFormat,
+    quality: int,
+    *,
+    overwrite: bool,
+) -> Path:
+    files = processed_files(config, session_date)
+    if not files:
+        print(
+            f"No edited files in {config.processed_dir_for(session_date)}; "
+            "converting from TIFF exports first."
+        )
+        do_convert(config, session_date, output_format, quality, overwrite=overwrite)
+        files = processed_files(config, session_date)
+    if not files:
+        raise SessionError(
+            f"No edited files available for {session_date} after conversion attempt"
+        )
+    dest = config.backup_work_dir(session_date) / EDITED_ZIP
+    zip_files(files, dest)
+    logging.info("Zipped %d edited files -> %s", len(files), dest)
+    print(f"Created {dest} ({len(files)} files)")
+    return dest
+
+
+def do_bundle(
+    config: RootConfig,
+    session_date: str,
+    *,
+    tags: tuple[str, ...],
+    encrypt: bool,
+    delete_intermediate: bool,
+) -> Path:
+    work_dir = config.backup_work_dir(session_date)
+    candidates = [work_dir / HEIC_ZIP, work_dir / RAW_ZIP, work_dir / EDITED_ZIP]
+    existing = [path for path in candidates if path.exists()]
+    if not existing:
+        raise SessionError(
+            f"No category zips found in {work_dir}; run backup-heic/backup-raw/backup-edited first"
+        )
+
+    run_date = parse_session_date(session_date)
+    final_archive = config.backups_dir / archive_name(run_date, tags, encrypted=encrypt)
+
+    if encrypt:
+        missing = missing_tools(bundle_tools(encrypt=True))
+        if missing:
+            raise RuntimeError(f"Missing required tools: {', '.join(missing)}")
+        password = prompt_password()
+    else:
+        password = None
+
+    bundle_archives(existing, final_archive, encrypt=encrypt, password=password)
+    logging.info("Bundled %d archives -> %s", len(existing), final_archive)
+    print(f"Bundle created: {final_archive}")
+    for path in existing:
+        print(f"  included: {path.name}")
+
+    if delete_intermediate:
+        shutil.rmtree(work_dir)
+        logging.info("Deleted intermediate folder: %s", work_dir)
+        print(f"Deleted intermediate folder: {work_dir}")
+    return final_archive
+
+
+# --------------------------------------------------------------------------- #
+# Command handlers.
+# --------------------------------------------------------------------------- #
+
+
 def estimate_command(args: argparse.Namespace) -> int:
     config = load_config(args.config)
     output_format, quality = resolve_format_and_quality(args, config)
-    inventory = scan_session(config)
-    samples = choose_sample_files(inventory.tiff_files)
+    session_date = resolve_session_date(
+        config,
+        args.session_date,
+        candidates=list_tiff_dates(config),
+        assume_yes=args.yes,
+        input_fn=input,
+        output_fn=print,
+    )
+    samples_source = tiff_files(config, session_date)
+    samples = choose_sample_files(samples_source)
     if not samples:
-        print("No TIFF files found.")
+        print(f"No TIFF files found in {config.tiff_dir_for(session_date)}.")
         return 0
 
     with tempfile.TemporaryDirectory(prefix="photo-flow-estimate-") as temp_dir:
@@ -102,11 +326,12 @@ def estimate_command(args: argparse.Namespace) -> int:
         else:
             convert_all(plans)
         result = estimate_total_size(
-            inventory.tiff_files,
+            samples_source,
             samples,
             tuple(plan.output_file for plan in plans),
         )
 
+    print(f"Session: {session_date}")
     print(f"Format: {output_format.value}")
     print(f"Quality: {quality}")
     print(f"Sample files: {result.sample_count}")
@@ -116,106 +341,186 @@ def estimate_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def convert_command(args: argparse.Namespace) -> int:
+    config = load_config(args.config)
+    output_format, quality = resolve_format_and_quality(args, config)
+    session_date = resolve_session_date(
+        config,
+        args.session_date,
+        candidates=list_tiff_dates(config),
+        assume_yes=args.yes,
+        input_fn=input,
+        output_fn=print,
+    )
+    overwrite = args.overwrite or config.overwrite_existing
+    _start_logging(config)
+    outputs = do_convert(config, session_date, output_format, quality, overwrite=overwrite)
+    print(f"Converted {len(outputs)} files into {config.processed_dir_for(session_date)}")
+    return 0
+
+
+def backup_heic_command(args: argparse.Namespace) -> int:
+    config = load_config(args.config)
+    session_date = resolve_session_date(
+        config,
+        args.session_date,
+        candidates=available_dates(config),
+        assume_yes=args.yes,
+        input_fn=input,
+        output_fn=print,
+    )
+    raw_name = resolve_raw_folder(
+        config,
+        session_date,
+        args.raw_name,
+        assume_yes=args.yes,
+        input_fn=input,
+        output_fn=print,
+    )
+    _start_logging(config)
+    do_backup_heic(config, session_date, raw_name)
+    return 0
+
+
+def backup_raw_command(args: argparse.Namespace) -> int:
+    config = load_config(args.config)
+    session_date = resolve_session_date(
+        config,
+        args.session_date,
+        candidates=available_dates(config),
+        assume_yes=args.yes,
+        input_fn=input,
+        output_fn=print,
+    )
+    raw_name = resolve_raw_folder(
+        config,
+        session_date,
+        args.raw_name,
+        assume_yes=args.yes,
+        input_fn=input,
+        output_fn=print,
+    )
+    _start_logging(config)
+    do_backup_raw(config, session_date, raw_name)
+    return 0
+
+
+def backup_edited_command(args: argparse.Namespace) -> int:
+    config = load_config(args.config)
+    output_format, quality = resolve_format_and_quality(args, config)
+    session_date = resolve_session_date(
+        config,
+        args.session_date,
+        candidates=available_dates(config),
+        assume_yes=args.yes,
+        input_fn=input,
+        output_fn=print,
+    )
+    overwrite = args.overwrite or config.overwrite_existing
+    _start_logging(config)
+    do_backup_edited(config, session_date, output_format, quality, overwrite=overwrite)
+    return 0
+
+
+def bundle_command(args: argparse.Namespace) -> int:
+    config = load_config(args.config)
+    session_date = resolve_session_date(
+        config,
+        args.session_date,
+        candidates=available_dates(config),
+        assume_yes=args.yes,
+        input_fn=input,
+        output_fn=print,
+    )
+    tags = resolve_tags(args, assume_yes=args.yes)
+    encrypt = resolve_encrypt(args, assume_yes=args.yes)
+    delete_intermediate = resolve_delete(args, session_date, assume_yes=args.yes)
+    _start_logging(config)
+    do_bundle(
+        config,
+        session_date,
+        tags=tags,
+        encrypt=encrypt,
+        delete_intermediate=delete_intermediate,
+    )
+    return 0
+
+
 def run_command(args: argparse.Namespace) -> int:
     config = load_config(args.config)
     output_format, quality = resolve_format_and_quality(args, config)
-    inventory = scan_session(config)
-    overwrite = args.overwrite or config.overwrite_existing
-    plans = build_conversion_plans(
-        inventory.tiff_files,
-        output_dir=config.converted_output_dir,
-        output_format=output_format,
-        quality=quality,
-        overwrite=overwrite,
+    session_date = resolve_session_date(
+        config,
+        args.session_date,
+        candidates=available_dates(config),
+        assume_yes=args.yes,
+        input_fn=input,
+        output_fn=print,
     )
-    tags = tuple(tag.strip() for tag in args.tags.split(",") if tag.strip())
+    raw_name = resolve_raw_folder(
+        config,
+        session_date,
+        args.raw_name,
+        assume_yes=args.yes,
+        input_fn=input,
+        output_fn=print,
+    )
+    overwrite = args.overwrite or config.overwrite_existing
+    tags = resolve_tags(args, assume_yes=args.yes)
+    encrypt = resolve_encrypt(args, assume_yes=args.yes)
+    delete_intermediate = resolve_delete(args, session_date, assume_yes=args.yes)
 
-    if args.dry_run:
-        print("Dry run completed. Planned converted files:")
-        for plan in plans:
-            print(f"- {plan.source_tiff.name} -> {plan.output_file.name}")
-        return 0
-
-    missing = missing_tools(required_tools_for(output_format, encrypted_backup=args.encrypt))
-    if missing:
-        raise RuntimeError(f"Missing required tools: {', '.join(missing)}")
-
-    timestamp = datetime.now(timezone.utc)
-    log_path = configure_logging(config.log_dir, timestamp)
-    logging.info("Starting photo-flow run")
-
-    if output_format is OutputFormat.PNG:
-        logging.warning("PNG output is lossless; quality setting is ignored by conversion")
-        print("Warning: PNG output is lossless; quality setting is ignored.")
-
-    if not confirm(f"Convert {len(plans)} TIFF files to {output_format.value}?", assume_yes=args.yes):
-        print("Conversion cancelled.")
-        return 1
-
-    convert_all(plans)
-    copy_metadata(plans)
-
-    verification_messages: list[str] = []
-    for plan in plans:
-        errors = verify_converted_file(plan.output_file)
-        if errors:
-            for error in errors:
-                logging.error("%s: %s", error.path, error.reason)
-            raise RuntimeError("Converted file verification failed")
-        read_metadata(plan.output_file)
-        identify_image(plan.output_file)
-        verification_messages.append(f"{plan.output_file.name} ok")
-
-    if confirm(f"Move {len(inventory.tiff_files)} TIFF files to macOS Trash?", assume_yes=False):
-        trash_files(inventory.tiff_files)
-        for path in inventory.tiff_files:
-            logging.info("Trashed TIFF: %s", path)
-
-    archive_password = prompt_password() if args.encrypt else None
-    local_archive = config.log_dir / archive_name(timestamp.date(), tags, encrypted=args.encrypt)
-
-    with tempfile.TemporaryDirectory(prefix="photo-flow-backup-") as staging:
-        staging_dir = Path(staging)
-        converted_files = tuple(plan.output_file for plan in plans)
-        files_to_hash = (*inventory.raw_files, *inventory.original_heic_files, *converted_files, log_path)
-        manifest = create_manifest(
-            timestamp=timestamp,
-            output_format=output_format,
-            quality=quality,
-            source_dirs={
-                "raw_dir": config.raw_dir,
-                "original_heic_dir": config.original_heic_dir,
-                "tiff_dir": config.tiff_dir,
-            },
-            converted_output_dir=config.converted_output_dir,
-            backup_destinations=config.backup_destinations,
-            files=files_to_hash,
-            tool_versions={},
-            warnings=(),
-            verification_results=tuple(verification_messages),
-        )
-        write_manifest(staging_dir / "manifest.json", manifest)
-        stage_backup_files(
-            staging_dir,
-            raw_files=inventory.raw_files,
-            original_heic_files=inventory.original_heic_files,
-            converted_files=converted_files,
-            log_path=log_path,
-        )
-        if args.encrypt:
-            backup_plan = BackupPlan(archive_path=local_archive, staging_dir=staging_dir, encrypted=True)
-            run_external_command(build_archive_command(backup_plan, password=archive_password), check=True, cwd=staging_dir)
-        else:
-            shutil.make_archive(str(local_archive.with_suffix("")), "zip", staging_dir)
-        copied, warnings = copy_to_existing_destinations(local_archive, config.backup_destinations)
-        for warning in warnings:
-            logging.warning(warning)
-            print(f"Warning: {warning}")
-
-    print(f"Backup created: {local_archive}")
-    for path in copied:
-        print(f"Backup copied: {path}")
+    _start_logging(config)
+    logging.info("Starting photo-flow run for %s (raw folder %s)", session_date, raw_name)
+    do_backup_heic(config, session_date, raw_name)
+    do_backup_raw(config, session_date, raw_name)
+    do_backup_edited(config, session_date, output_format, quality, overwrite=overwrite)
+    do_bundle(
+        config,
+        session_date,
+        tags=tags,
+        encrypt=encrypt,
+        delete_intermediate=delete_intermediate,
+    )
     return 0
+
+
+# --------------------------------------------------------------------------- #
+# Prompt helpers.
+# --------------------------------------------------------------------------- #
+
+
+def parse_tags(value: str) -> tuple[str, ...]:
+    return tuple(tag.strip() for tag in value.split(",") if tag.strip())
+
+
+def resolve_tags(args: argparse.Namespace, *, assume_yes: bool) -> tuple[str, ...]:
+    if args.tags is not None:
+        return parse_tags(args.tags)
+    if assume_yes:
+        return ()
+    return parse_tags(input("Tags (comma-separated, blank for none): "))
+
+
+def resolve_encrypt(args: argparse.Namespace, *, assume_yes: bool) -> bool:
+    if args.encrypt:
+        return True
+    if assume_yes:
+        return False
+    return confirm("Encrypt the final archive?", assume_yes=False)
+
+
+def resolve_delete(args: argparse.Namespace, session_date: str, *, assume_yes: bool) -> bool:
+    if getattr(args, "delete_intermediate", False):
+        return True
+    if getattr(args, "keep_intermediate", False):
+        return False
+    if assume_yes:
+        return False
+    return confirm(
+        f"Delete the intermediate Backups/{session_date} folder after bundling?",
+        assume_yes=False,
+    )
 
 
 def confirm(prompt: str, *, assume_yes: bool) -> bool:

@@ -3,20 +3,21 @@ import sys
 import pytest
 
 from photo_flow.commands import CommandError, run_command
-from photo_flow.dependencies import missing_tools, required_tools_for
+from photo_flow.dependencies import bundle_tools, conversion_tools, missing_tools
 from photo_flow.models import OutputFormat
 
 
-def test_required_tools_for_heic_includes_metadata_and_trash_tools():
-    tools = required_tools_for(OutputFormat.HEIC, encrypted_backup=True)
-
-    assert tools == ("exiftool", "magick", "7z", "trash")
+def test_conversion_tools_for_heic_uses_magick():
+    assert conversion_tools(OutputFormat.HEIC) == ("exiftool", "magick", "magick")
 
 
-def test_required_tools_for_jxl_uses_cjxl():
-    tools = required_tools_for(OutputFormat.JXL, encrypted_backup=False)
+def test_conversion_tools_for_jxl_uses_cjxl():
+    assert conversion_tools(OutputFormat.JXL) == ("exiftool", "magick", "cjxl")
 
-    assert tools == ("exiftool", "cjxl", "zip", "trash")
+
+def test_bundle_tools_requires_7z_only_when_encrypting():
+    assert bundle_tools(encrypt=True) == ("7z",)
+    assert bundle_tools(encrypt=False) == ()
 
 
 def test_missing_tools_reports_only_absent_tools():

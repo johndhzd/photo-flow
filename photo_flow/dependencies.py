@@ -6,10 +6,13 @@ from collections.abc import Callable
 from photo_flow.models import OutputFormat
 
 
-def required_tools_for(output_format: OutputFormat, *, encrypted_backup: bool) -> tuple[str, ...]:
-    conversion_tool = "cjxl" if output_format is OutputFormat.JXL else "magick"
-    archive_tool = "7z" if encrypted_backup else "zip"
-    return ("exiftool", conversion_tool, archive_tool, "trash")
+def conversion_tools(output_format: OutputFormat) -> tuple[str, ...]:
+    converter = "cjxl" if output_format is OutputFormat.JXL else "magick"
+    return ("exiftool", "magick", converter)
+
+
+def bundle_tools(*, encrypt: bool) -> tuple[str, ...]:
+    return ("7z",) if encrypt else ()
 
 
 def missing_tools(
@@ -17,4 +20,5 @@ def missing_tools(
     *,
     resolver: Callable[[str], str | None] = shutil.which,
 ) -> tuple[str, ...]:
-    return tuple(tool for tool in tools if resolver(tool) is None)
+    seen: dict[str, None] = dict.fromkeys(tools)
+    return tuple(tool for tool in seen if resolver(tool) is None)

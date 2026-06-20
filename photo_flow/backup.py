@@ -1,125 +1,109 @@
 from __future__ import annotations
 
-import hashlib
-import json
-import shutil
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
-from datetime import date, datetime
+import zipfile
+from collections.abc import Callable, Sequence
+from datetime import date
 from pathlib import Path
 
-from photo_flow.models import OutputFormat
+from photo_flow.commands import run_command
+from photo_flow.models import CommandResult
 
 
-@dataclass(frozen=True)
-class BackupPlan:
-    archive_path: Path
-    staging_dir: Path
-    encrypted: bool
+CategoryRunner = Callable[[Sequence[str]], CommandResult]
 
 
 def archive_name(run_date: date, tags: Sequence[str], *, encrypted: bool) -> str:
+    """Final bundle name like ``2026_03_08_japan_street.zip``.
+
+    Uses underscore-separated dates to match the on-disk session folder naming.
+    """
+
     clean_tags = tuple(_clean_tag(tag) for tag in tags if _clean_tag(tag))
     suffix = ".7z" if encrypted else ".zip"
+    stamp = f"{run_date:%Y_%m_%d}"
     if clean_tags:
-        return f"{run_date.isoformat()}_{'_'.join(clean_tags)}{suffix}"
-    return f"{run_date.isoformat()}{suffix}"
+        return f"{stamp}_{'_'.join(clean_tags)}{suffix}"
+    return f"{stamp}{suffix}"
 
 
 def _clean_tag(tag: str) -> str:
     return "".join(char if char.isalnum() or char in ("-", "_") else "_" for char in tag.strip())
 
 
-def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+def zip_files(files: Sequence[Path], dest_zip: Path, *, compress: bool = False) -> Path:
+    """Write ``files`` into ``dest_zip`` with flattened (basename) entries.
 
+    Defaults to stored (uncompressed) entries because raw, HEIF and converted
+    photos are already compressed; deflating them wastes time for no gain.
+    """
 
-def create_manifest(
-    *,
-    timestamp: datetime,
-    output_format: OutputFormat,
-    quality: int,
-    source_dirs: Mapping[str, Path],
-    converted_output_dir: Path,
-    backup_destinations: Sequence[Path],
-    files: Sequence[Path],
-    tool_versions: Mapping[str, str],
-    warnings: Sequence[str],
-    verification_results: Sequence[str],
-) -> dict[str, object]:
-    return {
-        "timestamp": timestamp.isoformat(),
-        "output_format": output_format.value,
-        "quality": quality,
-        "source_dirs": {key: str(value) for key, value in source_dirs.items()},
-        "converted_output_dir": str(converted_output_dir),
-        "backup_destinations": [str(path) for path in backup_destinations],
-        "tool_versions": dict(tool_versions),
-        "warnings": list(warnings),
-        "verification_results": list(verification_results),
-        "files": [
-            {
-                "path": str(path),
-                "size": path.stat().st_size,
-                "sha256": sha256_file(path),
-            }
-            for path in files
-        ],
-    }
-
-
-def write_manifest(path: Path, manifest: Mapping[str, object]) -> None:
-    path.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
-
-
-def stage_backup_files(
-    staging_dir: Path,
-    *,
-    raw_files: Sequence[Path],
-    original_heic_files: Sequence[Path],
-    converted_files: Sequence[Path],
-    log_path: Path,
-) -> tuple[Path, ...]:
-    staged: list[Path] = []
-    groups = (
-        ("raw", raw_files),
-        ("original_heic", original_heic_files),
-        ("converted", converted_files),
-        ("logs", (log_path,)),
-    )
-    for directory_name, files in groups:
-        target_dir = staging_dir / directory_name
-        target_dir.mkdir(parents=True, exist_ok=True)
+    if not files:
+        raise ValueError("Cannot create a zip with no files")
+    dest_zip.parent.mkdir(parents=True, exist_ok=True)
+    if dest_zip.exists():
+        dest_zip.unlink()
+    compression = zipfile.ZIP_DEFLATED if compress else zipfile.ZIP_STORED
+    seen: set[str] = set()
+    with zipfile.ZipFile(dest_zip, "w", compression, allowZip64=True) as archive:
         for source in files:
-            target = target_dir / source.name
-            shutil.copy2(source, target)
-            staged.append(target)
-    return tuple(staged)
+            arcname = source.name
+            if arcname in seen:
+                raise ValueError(f"Duplicate file name in archive: {arcname}")
+            seen.add(arcname)
+            archive.write(source, arcname=arcname)
+    return dest_zip
 
 
-def build_archive_command(plan: BackupPlan, *, password: str | None) -> tuple[str, ...]:
-    if plan.encrypted:
-        if not password:
-            raise ValueError("Encrypted backups require a password")
-        return ("7z", "a", "-t7z", "-mhe=on", f"-p{password}", str(plan.archive_path), ".")
-    return ("zip", "-r", str(plan.archive_path), ".")
+def build_bundle_command(
+    final_archive: Path,
+    files: Sequence[Path],
+    *,
+    password: str | None,
+) -> tuple[str, ...]:
+    if not password:
+        raise ValueError("Encrypted bundles require a password")
+    return (
+        "7z",
+        "a",
+        "-t7z",
+        "-mhe=on",
+        f"-p{password}",
+        str(final_archive),
+        *(str(path) for path in files),
+    )
 
 
-def copy_to_existing_destinations(
-    archive_path: Path,
-    destinations: Sequence[Path],
-) -> tuple[tuple[Path, ...], tuple[str, ...]]:
-    copied: list[Path] = []
-    warnings: list[str] = []
-    for destination in destinations:
-        if not destination.exists() or not destination.is_dir():
-            warnings.append(f"Backup destination does not exist: {destination}")
-            continue
-        target = destination / archive_path.name
-        shutil.copy2(archive_path, target)
-        copied.append(target)
-    return tuple(copied), tuple(warnings)
+def bundle_archives(
+    category_zips: Sequence[Path],
+    final_archive: Path,
+    *,
+    encrypt: bool,
+    password: str | None = None,
+    runner: CategoryRunner | None = None,
+) -> Path:
+    """Combine the per-category zips into a single final archive.
+
+    Unencrypted bundles are plain (stored) zips. Encrypted bundles delegate to
+    ``7z`` with header encryption enabled.
+    """
+
+    if not category_zips:
+        raise ValueError("No category archives to bundle")
+    final_archive.parent.mkdir(parents=True, exist_ok=True)
+    if final_archive.exists():
+        final_archive.unlink()
+
+    if encrypt:
+        command_runner = runner or (lambda args: run_command(args, check=True))
+        command_runner(build_bundle_command(final_archive, category_zips, password=password))
+        return final_archive
+
+    seen: set[str] = set()
+    with zipfile.ZipFile(final_archive, "w", zipfile.ZIP_STORED, allowZip64=True) as archive:
+        for source in category_zips:
+            arcname = source.name
+            if arcname in seen:
+                raise ValueError(f"Duplicate file name in bundle: {arcname}")
+            seen.add(arcname)
+            archive.write(source, arcname=arcname)
+    return final_archive

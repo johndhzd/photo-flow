@@ -1,126 +1,90 @@
-from datetime import date, datetime, timezone
-from pathlib import Path
+import zipfile
+from datetime import date
+
+import pytest
 
 from photo_flow.backup import (
-    BackupPlan,
     archive_name,
-    build_archive_command,
-    copy_to_existing_destinations,
-    create_manifest,
-    stage_backup_files,
-    sha256_file,
+    build_bundle_command,
+    bundle_archives,
+    zip_files,
 )
-from photo_flow.models import OutputFormat
 
 
-def test_archive_name_uses_date_tags_and_extension():
-    assert archive_name(date(2026, 6, 10), ("japan", "street"), encrypted=False) == "2026-06-10_japan_street.zip"
-    assert archive_name(date(2026, 6, 10), ("private",), encrypted=True) == "2026-06-10_private.7z"
-    assert archive_name(date(2026, 6, 10), (), encrypted=False) == "2026-06-10.zip"
+def test_archive_name_uses_underscore_date_tags_and_extension():
+    assert archive_name(date(2026, 3, 8), ("japan", "street"), encrypted=False) == "2026_03_08_japan_street.zip"
+    assert archive_name(date(2026, 3, 8), ("private",), encrypted=True) == "2026_03_08_private.7z"
+    assert archive_name(date(2026, 3, 8), (), encrypted=False) == "2026_03_08.zip"
 
 
 def test_archive_name_sanitizes_tags():
-    assert archive_name(date(2026, 6, 10), ("private trip", "x/y"), encrypted=False) == "2026-06-10_private_trip_x_y.zip"
+    assert archive_name(date(2026, 3, 8), ("private trip", "x/y"), encrypted=False) == "2026_03_08_private_trip_x_y.zip"
 
 
-def test_sha256_file_hashes_content(tmp_path):
-    path = tmp_path / "file.txt"
-    path.write_text("abc", encoding="utf-8")
+def test_zip_files_flattens_names(tmp_path):
+    a = tmp_path / "src" / "DSC0001.ARW"
+    b = tmp_path / "src" / "DSC0002.ARW"
+    a.parent.mkdir(parents=True)
+    a.write_bytes(b"one")
+    b.write_bytes(b"two")
+    dest = tmp_path / "out" / "original_raw.zip"
 
-    assert sha256_file(path) == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    zip_files((a, b), dest)
 
-
-def test_create_manifest_lists_files_and_hashes(tmp_path):
-    raw = tmp_path / "DSC0001.ARW"
-    raw.write_bytes(b"raw")
-    manifest = create_manifest(
-        timestamp=datetime(2026, 6, 10, 12, 0, tzinfo=timezone.utc),
-        output_format=OutputFormat.HEIC,
-        quality=90,
-        source_dirs={"raw_dir": tmp_path},
-        converted_output_dir=tmp_path / "converted",
-        backup_destinations=(tmp_path / "backup",),
-        files=(raw,),
-        tool_versions={"exiftool": "exiftool 13.0"},
-        warnings=("missing destination",),
-        verification_results=("DSC0001.heic ok",),
-    )
-
-    assert manifest["output_format"] == "heic"
-    assert manifest["quality"] == 90
-    assert manifest["files"][0]["path"] == str(raw)
-    assert manifest["files"][0]["sha256"] == sha256_file(raw)
+    with zipfile.ZipFile(dest) as archive:
+        assert sorted(archive.namelist()) == ["DSC0001.ARW", "DSC0002.ARW"]
+        assert archive.read("DSC0001.ARW") == b"one"
 
 
-def test_build_archive_command_uses_zip_for_unencrypted(tmp_path):
-    plan = BackupPlan(archive_path=tmp_path / "backup.zip", staging_dir=tmp_path / "stage", encrypted=False)
+def test_zip_files_rejects_duplicate_basenames(tmp_path):
+    a = tmp_path / "x" / "DSC0001.ARW"
+    b = tmp_path / "y" / "DSC0001.ARW"
+    a.parent.mkdir(parents=True)
+    b.parent.mkdir(parents=True)
+    a.write_bytes(b"a")
+    b.write_bytes(b"b")
 
-    assert build_archive_command(plan, password=None) == (
-        "zip",
-        "-r",
-        str(tmp_path / "backup.zip"),
-        ".",
-    )
-
-
-def test_build_archive_command_uses_7z_for_encrypted(tmp_path):
-    plan = BackupPlan(archive_path=tmp_path / "backup.7z", staging_dir=tmp_path / "stage", encrypted=True)
-
-    assert build_archive_command(plan, password="secret") == (
-        "7z",
-        "a",
-        "-t7z",
-        "-mhe=on",
-        "-psecret",
-        str(tmp_path / "backup.7z"),
-        ".",
-    )
+    with pytest.raises(ValueError, match="Duplicate file name"):
+        zip_files((a, b), tmp_path / "out.zip")
 
 
-def test_copy_to_existing_destinations_skips_missing_paths(tmp_path):
-    archive = tmp_path / "backup.zip"
-    archive.write_bytes(b"archive")
-    existing = tmp_path / "existing"
-    existing.mkdir()
-    missing = tmp_path / "missing"
-
-    copied, warnings = copy_to_existing_destinations(archive, (existing, missing))
-
-    assert copied == (existing / "backup.zip",)
-    assert (existing / "backup.zip").read_bytes() == b"archive"
-    assert warnings == (f"Backup destination does not exist: {missing}",)
+def test_zip_files_rejects_empty_input(tmp_path):
+    with pytest.raises(ValueError, match="no files"):
+        zip_files((), tmp_path / "out.zip")
 
 
-def test_stage_backup_files_keeps_original_and_converted_heic_separate(tmp_path):
-    raw = tmp_path / "raw" / "DSC0001.ARW"
-    original = tmp_path / "original" / "DSC0001.heic"
-    converted = tmp_path / "converted" / "DSC0001.heic"
-    log = tmp_path / "logs" / "run.log"
-    for path, content in (
-        (raw, b"raw"),
-        (original, b"original"),
-        (converted, b"converted"),
-        (log, b"log"),
-    ):
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(content)
-    staging = tmp_path / "stage"
+def test_bundle_archives_plain_zip_contains_category_zips(tmp_path):
+    heic = zip_files((_file(tmp_path, "a.heic"),), tmp_path / "work" / "original_heic.zip")
+    edited = zip_files((_file(tmp_path, "b.heic"),), tmp_path / "work" / "edited.zip")
+    final = tmp_path / "Backups" / "2026_03_08.zip"
 
-    staged = stage_backup_files(
-        staging,
-        raw_files=(raw,),
-        original_heic_files=(original,),
-        converted_files=(converted,),
-        log_path=log,
-    )
+    bundle_archives((heic, edited), final, encrypt=False)
 
-    assert (staging / "raw" / "DSC0001.ARW").read_bytes() == b"raw"
-    assert (staging / "original_heic" / "DSC0001.heic").read_bytes() == b"original"
-    assert (staging / "converted" / "DSC0001.heic").read_bytes() == b"converted"
-    assert (staging / "logs" / "run.log").read_bytes() == b"log"
-    assert staged == (
-        staging / "raw" / "DSC0001.ARW",
-        staging / "original_heic" / "DSC0001.heic",
-        staging / "converted" / "DSC0001.heic",
-        staging / "logs" / "run.log",
-    )
+    with zipfile.ZipFile(final) as archive:
+        assert sorted(archive.namelist()) == ["edited.zip", "original_heic.zip"]
+
+
+def test_bundle_archives_encrypted_uses_runner(tmp_path):
+    calls = []
+
+    def runner(args):
+        calls.append(tuple(args))
+
+        class _Result:
+            ok = True
+
+        return _Result()
+
+    heic = zip_files((_file(tmp_path, "a.heic"),), tmp_path / "work" / "original_heic.zip")
+    final = tmp_path / "Backups" / "2026_03_08_private.7z"
+
+    bundle_archives((heic,), final, encrypt=True, password="secret", runner=runner)
+
+    assert calls == [build_bundle_command(final, (heic,), password="secret")]
+
+
+def _file(base, name):
+    path = base / "files" / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(name.encode())
+    return path
