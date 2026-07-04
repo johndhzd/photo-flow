@@ -29,7 +29,7 @@ def parallel_map(
     order, so callers can zip results back to their inputs.
 
     Uses threads (not processes) because the work is waiting on external
-    subprocesses (magick, exiftool, cjxl) — the GIL is released during
+    subprocesses (sips, magick, exiftool, cjxl) — the GIL is released during
     ``subprocess.run``.
     """
 

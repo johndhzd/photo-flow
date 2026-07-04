@@ -7,8 +7,8 @@ from photo_flow.dependencies import bundle_tools, conversion_tools, missing_tool
 from photo_flow.models import OutputFormat
 
 
-def test_conversion_tools_for_heic_uses_magick():
-    assert conversion_tools(OutputFormat.HEIC) == ("exiftool", "magick", "magick")
+def test_conversion_tools_for_heic_uses_sips():
+    assert conversion_tools(OutputFormat.HEIC) == ("exiftool", "magick", "sips")
 
 
 def test_conversion_tools_for_jxl_uses_cjxl():

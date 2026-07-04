@@ -43,14 +43,19 @@ def test_build_conversion_plans_refuses_existing_output_without_overwrite(tmp_pa
         )
 
 
-def test_build_heic_command_uses_magick_quality():
+def test_build_heic_command_uses_sips_format_options():
     plan = ConversionPlan(Path("in.tif"), Path("out.heic"), OutputFormat.HEIC, 90)
 
     assert build_conversion_command(plan) == (
-        "magick",
-        "in.tif",
-        "-quality",
+        "sips",
+        "-s",
+        "format",
+        "heic",
+        "-s",
+        "formatOptions",
         "90",
+        "in.tif",
+        "--out",
         "out.heic",
     )
 

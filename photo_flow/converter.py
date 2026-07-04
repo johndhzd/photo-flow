@@ -34,6 +34,19 @@ def build_conversion_command(plan: ConversionPlan) -> tuple[str, ...]:
         return ("cjxl", str(plan.source_tiff), str(plan.output_file), "-q", str(plan.quality))
     if plan.output_format is OutputFormat.PNG:
         return ("magick", str(plan.source_tiff), str(plan.output_file))
+    if plan.output_format is OutputFormat.HEIC:
+        return (
+            "sips",
+            "-s",
+            "format",
+            "heic",
+            "-s",
+            "formatOptions",
+            str(plan.quality),
+            str(plan.source_tiff),
+            "--out",
+            str(plan.output_file),
+        )
     return (
         "magick",
         str(plan.source_tiff),

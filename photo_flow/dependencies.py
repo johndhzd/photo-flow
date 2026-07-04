@@ -7,7 +7,12 @@ from photo_flow.models import OutputFormat
 
 
 def conversion_tools(output_format: OutputFormat) -> tuple[str, ...]:
-    converter = "cjxl" if output_format is OutputFormat.JXL else "magick"
+    if output_format is OutputFormat.JXL:
+        converter = "cjxl"
+    elif output_format is OutputFormat.HEIC:
+        converter = "sips"
+    else:
+        converter = "magick"
     return ("exiftool", "magick", converter)
 
 
