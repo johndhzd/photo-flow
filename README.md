@@ -14,6 +14,24 @@ cp config.example.yaml config.yaml
 
 Edit `config.yaml` to point `root_dir` at your library (e.g. `/Volumes/FastData/PhotoEdit`).
 
+## Interactive TUI
+
+Run `photo-flow` with no subcommand to open the terminal UI:
+
+```bash
+photo-flow                       # uses ./config.yaml
+photo-flow --config config.yaml  # explicit config
+photo-flow tui --config config.yaml
+```
+
+Pick a session on the left to see its TIFF/processed counts, the matched
+`RawPhotos` folder, and which backup zips already exist. Adjust format, quality,
+tags, and the overwrite/encrypt/delete toggles, then run any action (Estimate,
+Convert, Backup HEIC/RAW/edited, Bundle, Full pipeline) against the selected
+session. Progress and command output stream into the log pane. Press `r` to
+refresh and `q` to quit. The individual subcommands below remain available for
+scripting.
+
 ## Library layout
 
 ```

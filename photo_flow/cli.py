@@ -14,7 +14,12 @@ from photo_flow.commands import run_command as run_external_command
 from photo_flow.config import ConfigError, load_config
 from photo_flow.converter import build_conversion_command, build_conversion_plans
 from photo_flow.dependencies import bundle_tools, conversion_tools, missing_tools
-from photo_flow.estimator import choose_sample_files, estimate_total_size, format_bytes
+from photo_flow.estimator import (
+    EstimateResult,
+    choose_sample_files,
+    estimate_total_size,
+    format_bytes,
+)
 from photo_flow.integrity import identify_image, verify_converted_file
 from photo_flow.logging_setup import configure_logging
 from photo_flow.metadata import build_copy_metadata_command, read_metadata
@@ -47,6 +52,12 @@ EDITED_ZIP = "edited.zip"
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.command in (None, "tui"):
+        try:
+            return launch_tui(args)
+        except (ConfigError, SessionError, ValueError, RuntimeError) as exc:
+            print(f"Error: {exc}")
+            return 1
     handlers = {
         "estimate": estimate_command,
         "convert": convert_command,
@@ -67,9 +78,29 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
 
 
+def launch_tui(args: argparse.Namespace) -> int:
+    config_path = getattr(args, "config", None) or Path("config.yaml")
+    config = load_config(config_path)
+    from photo_flow.tui import run_tui
+
+    return run_tui(config, config_path)
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="photo-flow")
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    parser = argparse.ArgumentParser(
+        prog="photo-flow",
+        description="Run without a subcommand to open the interactive TUI.",
+    )
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        help="config file used by the TUI when no subcommand is given (default: config.yaml)",
+    )
+    subparsers = parser.add_subparsers(dest="command", required=False)
+
+    tui = subparsers.add_parser("tui", help="open the interactive terminal UI (default)")
+    tui.add_argument("--config", type=Path, default=argparse.SUPPRESS, help="config file")
 
     estimate = subparsers.add_parser("estimate", help="estimate converted output size for a session")
     _add_config_date(estimate)
@@ -236,6 +267,53 @@ def do_convert(
     return tuple(plan.output_file for plan in plans)
 
 
+def do_estimate(
+    config: RootConfig,
+    session_date: str,
+    output_format: OutputFormat,
+    quality: int,
+    *,
+    workers: int = 1,
+    dry_sample_size: int = 0,
+) -> EstimateResult | None:
+    """Convert a handful of sample TIFFs and extrapolate the full output size.
+
+    Returns ``None`` when the session has no TIFF files. Shared by the
+    ``estimate`` command and the TUI so the sampling logic lives in one place.
+    """
+
+    samples_source = tiff_files(config, session_date)
+    samples = choose_sample_files(samples_source)
+    if not samples:
+        return None
+
+    with tempfile.TemporaryDirectory(prefix="photo-flow-estimate-") as temp_dir:
+        temp_output_dir = Path(temp_dir)
+        plans = build_conversion_plans(
+            samples,
+            output_dir=temp_output_dir,
+            output_format=output_format,
+            quality=quality,
+            overwrite=True,
+        )
+        if dry_sample_size:
+            for plan in plans:
+                plan.output_file.write_bytes(b"x" * dry_sample_size)
+        else:
+            parallel_map(
+                plans,
+                _convert_one,
+                workers=workers,
+                desc="Sampling",
+                label_fn=lambda p: p.source_tiff.name,
+            )
+        return estimate_total_size(
+            samples_source,
+            samples,
+            tuple(plan.output_file for plan in plans),
+        )
+
+
 def do_backup_heic(config: RootConfig, session_date: str, raw_name: str) -> Path:
     files = original_heic_files(config, raw_name)
     if not files:
@@ -298,6 +376,7 @@ def do_bundle(
     tags: tuple[str, ...],
     encrypt: bool,
     delete_intermediate: bool,
+    password: str | None = None,
 ) -> Path:
     work_dir = config.backup_work_dir(session_date)
     candidates = [work_dir / HEIC_ZIP, work_dir / RAW_ZIP, work_dir / EDITED_ZIP]
@@ -314,7 +393,8 @@ def do_bundle(
         missing = missing_tools(bundle_tools(encrypt=True))
         if missing:
             raise RuntimeError(f"Missing required tools: {', '.join(missing)}")
-        password = prompt_password()
+        if password is None:
+            password = prompt_password()
     else:
         password = None
 
@@ -349,37 +429,17 @@ def estimate_command(args: argparse.Namespace) -> int:
         input_fn=input,
         output_fn=print,
     )
-    samples_source = tiff_files(config, session_date)
-    samples = choose_sample_files(samples_source)
-    if not samples:
+    result = do_estimate(
+        config,
+        session_date,
+        output_format,
+        quality,
+        workers=workers,
+        dry_sample_size=args.dry_sample_size,
+    )
+    if result is None:
         print(f"No TIFF files found in {config.tiff_dir_for(session_date)}.")
         return 0
-
-    with tempfile.TemporaryDirectory(prefix="photo-flow-estimate-") as temp_dir:
-        temp_output_dir = Path(temp_dir)
-        plans = build_conversion_plans(
-            samples,
-            output_dir=temp_output_dir,
-            output_format=output_format,
-            quality=quality,
-            overwrite=True,
-        )
-        if args.dry_sample_size:
-            for plan in plans:
-                plan.output_file.write_bytes(b"x" * args.dry_sample_size)
-        else:
-            parallel_map(
-                plans,
-                _convert_one,
-                workers=workers,
-                desc="Sampling",
-                label_fn=lambda p: p.source_tiff.name,
-            )
-        result = estimate_total_size(
-            samples_source,
-            samples,
-            tuple(plan.output_file for plan in plans),
-        )
 
     print(f"Session: {session_date}")
     print(f"Format: {output_format.value}")
